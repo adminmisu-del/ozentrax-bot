@@ -1,0 +1,254 @@
+import os
+import sqlite3
+import logging
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
+
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+ADMIN_ID = 8249546118
+DB_NAME = "ozentrax.db"
+
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
+
+def init_db():
+    with sqlite3.connect(DB_NAME) as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                balance REAL DEFAULT 0,
+                referred_by INTEGER DEFAULT 0
+            )
+        """)
+
+
+def get_user(user_id):
+    with sqlite3.connect(DB_NAME) as db:
+        return db.execute(
+            "SELECT user_id, username, balance, referred_by "
+            "FROM users WHERE user_id = ?",
+            (user_id,)
+        ).fetchone()
+
+
+def main_menu():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💰 Balance", callback_data="balance"),
+            InlineKeyboardButton("📺 Watch Ads", callback_data="ads"),
+        ],
+        [
+            InlineKeyboardButton("📋 Tasks", callback_data="tasks"),
+            InlineKeyboardButton("👥 Referral", callback_data="referral"),
+        ],
+        [
+            InlineKeyboardButton("💳 Wallet", callback_data="wallet"),
+            InlineKeyboardButton("🎁 Daily Bonus", callback_data="daily"),
+        ],
+    ])
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    referred_by = 0
+
+    if context.args:
+        try:
+            candidate = int(context.args[0])
+            if candidate != user.id:
+                referred_by = candidate
+        except ValueError:
+            pass
+
+    with sqlite3.connect(DB_NAME) as db:
+        existing = db.execute(
+            "SELECT user_id FROM users WHERE user_id = ?",
+            (user.id,)
+        ).fetchone()
+
+        if not existing:
+            db.execute(
+                "INSERT INTO users "
+                "(user_id, username, balance, referred_by) "
+                "VALUES (?, ?, 0, ?)",
+                (user.id, user.username or "", referred_by)
+            )
+
+    text = (
+        "💙 Welcome to OZENTRAX!\n\n"
+        f"Hello, {user.first_name}!\n\n"
+        "এখান থেকে আপনার অ্যাকাউন্ট ও মেনু ব্যবহার করুন।\n"
+        "ব্যালান্স ও রিওয়ার্ডের নিয়ম চালু হওয়ার আগে "
+        "কোনো আয় নিশ্চিত নয়।"
+    )
+
+    await update.message.reply_text(
+        text,
+        reply_markup=main_menu()
+    )
+
+
+async def menu_click(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+    data = query.data
+
+    if data == "balance":
+        user = get_user(user_id)
+        balance = user[2] if user else 0
+        text = f"💰 Your Balance: ৳{balance:.2f}"
+
+    elif data == "referral":
+        bot_username = context.bot.username
+        link = f"https://t.me/{bot_username}?start={user_id}"
+        text = (
+            "👥 Your Referral Link\n\n"
+            f"{link}\n\n"
+            "রেফারেল রিওয়ার্ড এখনো স্বয়ংক্রিয়ভাবে "
+            "চালু করা হয়নি।"
+        )
+
+    elif data == "ads":
+        text = (
+            "📺 Watch Ads\n\n"
+            "বিজ্ঞাপন দেখার সিস্টেম এখনো সংযুক্ত হয়নি। "
+            "বিজ্ঞাপন যাচাই না করে রিওয়ার্ড দেওয়া হবে না।"
+        )
+
+    elif data == "tasks":
+        text = (
+            "📋 Tasks\n\n"
+            "এখনো কোনো টাস্ক যোগ করা হয়নি।"
+        )
+
+    elif data == "wallet":
+        text = (
+            "💳 Wallet\n\n"
+            "Withdrawal সিস্টেম পরের ধাপে তৈরি হবে।"
+        )
+
+    elif data == "daily":
+        text = (
+            "🎁 Daily Bonus\n\n"
+            "Daily Bonus এখনো চালু হয়নি।"
+        )
+
+    else:
+        text = "OZENTRAX"
+
+    await query.message.reply_text(
+        text,
+        reply_markup=main_menu()
+    )
+
+
+async def admin_stats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Access denied.")
+        return
+
+    with sqlite3.connect(DB_NAME) as db:
+        count = db.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        total_balance = db.execute(
+            "SELECT COALESCE(SUM(balance), 0) FROM users"
+        ).fetchone()[0]
+
+    await update.message.reply_text(
+        "🔐 OZENTRAX ADMIN\n\n"
+        f"👥 Total users: {count}\n"
+        f"💰 Total recorded balance: ৳{total_balance:.2f}"
+    )
+
+
+async def add_balance(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Access denied.")
+        return
+
+    if len(context.args) != 2:
+        await update.message.reply_text(
+            "ব্যবহার:\n/addbalance USER_ID AMOUNT\n\n"
+            "উদাহরণ:\n/addbalance 123456789 10"
+        )
+        return
+
+    try:
+        target_id = int(context.args[0])
+        amount = float(context.args[1])
+
+        if amount <= 0 or amount > 100000:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "সঠিক User ID এবং 0-এর বেশি Amount দাও "
+            "(সর্বোচ্চ 100000)।"
+        )
+        return
+
+    with sqlite3.connect(DB_NAME) as db:
+        result = db.execute(
+            "UPDATE users SET balance = balance + ? "
+            "WHERE user_id = ?",
+            (amount, target_id)
+        )
+
+    if result.rowcount == 0:
+        await update.message.reply_text(
+            "এই User ID পাওয়া যায়নি। ব্যবহারকারীকে "
+            "আগে /start দিতে হবে।"
+        )
+        return
+
+    await update.message.reply_text(
+        f"✅ ৳{amount:.2f} যোগ হয়েছে।\n"
+        f"User ID: {target_id}"
+    )
+
+
+def main():
+    if not BOT_TOKEN:
+        raise RuntimeError(
+            "BOT_TOKEN environment variable is missing."
+        )
+
+    init_db()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("stats", admin_stats))
+    app.add_handler(CommandHandler("addbalance", add_balance))
+    app.add_handler(CallbackQueryHandler(menu_click))
+
+    print("OZENTRAX Bot is starting...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
